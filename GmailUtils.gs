@@ -473,11 +473,11 @@ function formatEmails_(emails) {
  * with toString.
  *
  * @param {Object} obj
- * @param {string} class
+ * @param {string} className
  * @return {boolean}
  */
-function isa_(obj, class) {
-  return typeof obj == 'object' && typeof obj.constructor == 'undefined' && obj.toString() == class;
+function isa_(obj, className) {
+  return typeof obj == 'object' && typeof obj.constructor == 'undefined' && obj.toString() == className;
 }
 
 /**

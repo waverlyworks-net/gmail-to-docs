@@ -1,0 +1,395 @@
+diff --git a/appsscript.json b/appsscript.json
+new file mode 100644
+index 0000000..b1c2d3e
+--- /dev/null
++++ b/appsscript.json
+@@ -0,0 +1,8 @@
++{
++  "timeZone": "Etc/UTC",
++  "dependencies": {},
++  "exceptionLogging": "STACKDRIVER",
++  "runtimeVersion": "V8"
++}
++
++
+diff --git a/docs_mode.gs b/docs_mode.gs
+new file mode 100644
+index 0000000..0f4e2aa
+--- /dev/null
++++ b/docs_mode.gs
+@@ -0,0 +1,153 @@
++/**
++ * docs_mode.gs
++ * Orchestrator: incremental processing of Gmail messages and prepending them into
++ * a single consolidated Google Doc (newest-first).
++ *
++ * Behavior:
++ *  - Uses a Gmail label (CONSOLIDATE_LABEL) to find candidate threads/messages.
++ *  - Keeps state in Script Properties:
++ *      PROP_LAST_ISO -> ISO string of last-processed message date
++ *      PROP_CONSOLIDATED_DOC -> docId of the consolidated doc
++ *  - Newest messages are prepended (appear at top).
++ *  - Two output modes supported:
++ *      OUTPUT_MODE = 'doc_plain'  -> reliable plain-text conversion
++ *      OUTPUT_MODE = 'doc_html'   -> attempt HTML -> Google Doc conversion (requires Drive Advanced Service)
++ *
++ * NOTE:
++ *  - This is intentionally conservative as a first step.
++ *  - Attachments and inline images are handled in later iterations.
++ */
++
++/* =========================
++   Configuration
++   ========================= */
++const CONSOLIDATE_LABEL       = 'CONSOLIDATE_TO_DOC'; // <-- change to your Gmail label
++const PROP_LAST_ISO           = 'gtd_last_iso';
++const PROP_CONSOLIDATED_DOC   = 'gtd_consolidated_doc_id';
++const MAX_MESSAGES_PER_RUN    = 200;
++
++/* Choose 'doc_plain' for reliability. Use 'doc_html' for HTML->Doc (requires Advanced Drive Service). */
++const OUTPUT_MODE             = 'doc_plain'; // or 'doc_html'
++
++/**
++ * One-time initialization (optional).
++ * - Creates the consolidated Doc if missing.
++ * - Seeds last-processed timestamp if not present.
++ */
++function gtd_init() {
++  const props = PropertiesService.getScriptProperties();
++  if (!props.getProperty(PROP_LAST_ISO)) {
++    props.setProperty(PROP_LAST_ISO, '1970-01-01T00:00:00Z');
++  }
++  if (!props.getProperty(PROP_CONSOLIDATED_DOC)) {
++    const doc = DocumentApp.create('gtd_consolidated_doc');
++    props.setProperty(PROP_CONSOLIDATED_DOC, doc.getId());
++    Logger.log('Created consolidated doc: %s', doc.getId());
++  }
++  Logger.log('Initialized. lastISO=%s docId=%s',
++             props.getProperty(PROP_LAST_ISO),
++             props.getProperty(PROP_CONSOLIDATED_DOC));
++}
++
++/**
++ * Entry point - schedule this on a time trigger (e.g., every 10 minutes).
++ */
++function processMessagesToDoc() {
++  const props = PropertiesService.getScriptProperties();
++  const lastISO = props.getProperty(PROP_LAST_ISO) || '1970-01-01T00:00:00Z';
++  let consolidatedDocId = props.getProperty(PROP_CONSOLIDATED_DOC);
++
++  Logger.log('processMessagesToDoc starting. lastISO=%s consolidatedDocId=%s', lastISO, consolidatedDocId);
++
++  // Ensure consolidated doc exists
++  if (!consolidatedDocId) {
++    const doc = DocumentApp.create('gtd_consolidated_doc');
++    consolidatedDocId = doc.getId();
++    props.setProperty(PROP_CONSOLIDATED_DOC, consolidatedDocId);
++    Logger.log('Created new consolidated doc: %s', consolidatedDocId);
++  }
++
++  const lastDate = new Date(lastISO);
++
++  // Find threads with the label
++  const query = `label:${CONSOLIDATE_LABEL}`;
++  const threads = GmailApp.search(query, 0, MAX_MESSAGES_PER_RUN);
++
++  // Collect messages newer than lastDate
++  let newMessages = [];
++  for (let i = 0; i < threads.length; i++) {
++    const t = threads[i];
++    const msgs = t.getMessages();
++    for (let j = 0; j < msgs.length; j++) {
++      const m = msgs[j];
++      const d = m.getDate();
++      if (d > lastDate) {
++        newMessages.push({date: d, message: m});
++      }
++    }
++  }
++
++  if (newMessages.length === 0) {
++    Logger.log('No new messages to process.');
++    return;
++  }
++
++  // Sort newest -> oldest
++  newMessages.sort((a,b) => b.date - a.date);
++  Logger.log('Found %s new messages.', newMessages.length);
++
++  let newestSeen = lastDate;
++
++  // Process each new message (newest-first)
++  newMessages.forEach(item => {
++    const msg = item.message;
++    try {
++      if (OUTPUT_MODE === 'doc_plain') {
++        prependMessageToDocPlain(msg, consolidatedDocId);
++      } else if (OUTPUT_MODE === 'doc_html') {
++        prependMessageHtmlToDoc(msg, consolidatedDocId);
++      } else {
++        throw new Error('Unknown OUTPUT_MODE: ' + OUTPUT_MODE);
++      }
++      if (item.date > newestSeen) newestSeen = item.date;
++      Logger.log('Processed message: %s (date=%s)', msg.getSubject(), msg.getDate());
++    } catch (e) {
++      Logger.log('Error processing message (subject=%s): %s', msg.getSubject(), e.toString());
++    }
++  });
++
++  // Update state
++  props.setProperty(PROP_LAST_ISO, newestSeen.toISOString());
++  Logger.log('State updated. new lastISO=%s', newestSeen.toISOString());
++}
++
+diff --git a/docs_utils.gs b/docs_utils.gs
+new file mode 100644
+index 0000000..1b3d5cc
+--- /dev/null
++++ b/docs_utils.gs
+@@ -0,0 +1,195 @@
++/**
++ * docs_utils.gs
++ * Helpers for Google-Doc output mode.
++ *
++ * Contains:
++ *  - prependMessageToDocPlain(msg, consolidatedDocId)
++ *  - convertHtmlToDoc(htmlString, title)  (requires Advanced Drive service 'Drive')
++ *  - prependMessageHtmlToDoc(msg, consolidatedDocId)
++ *  - escapeHtml(s)
++ *  - copyElementToBody(child, destBody)   (basic element copier)
++ */
++
++/**
++ * Prepend a message into consolidated doc using plain text (very reliable).
++ * Newest messages are inserted at the top.
++ */
++function prependMessageToDocPlain(msg, consolidatedDocId) {
++  const mainDoc  = DocumentApp.openById(consolidatedDocId);
++  const mainBody = mainDoc.getBody();
++
++  // Build temporary doc for the message content
++  const tmpDoc  = DocumentApp.create('gtd_tmp_msg_' + new Date().getTime());
++  const tmpBody = tmpDoc.getBody();
++
++  tmpBody.appendParagraph('--- EMAIL START ---').setHeading(DocumentApp.ParagraphHeading.HEADING6);
++  tmpBody.appendParagraph('Subject: ' + (msg.getSubject() || '(no subject)'));
++  tmpBody.appendParagraph('From: ' + (msg.getFrom() || ''));
++  tmpBody.appendParagraph('To: ' + (msg.getTo() || ''));
++  tmpBody.appendParagraph('Date: ' + msg.getDate().toString());
++  tmpBody.appendParagraph('');
++
++  const plain = (msg.getPlainBody && msg.getPlainBody()) ? msg.getPlainBody()
++               : (msg.getBody && msg.getBody()) ? msg.getBody()
++               : '(no body)';
++  plain.split(/\r?\n/).forEach(line => {
++    tmpBody.appendParagraph(line);
++  });
++
++  tmpBody.appendParagraph('--- EMAIL END ---');
++  tmpBody.appendPageBreak();
++
++  // Insert tmpDoc children into mainDoc at the top (insert in reverse so order is preserved)
++  const n = tmpBody.getNumChildren();
++  for (let i = n - 1; i >= 0; i--) {
++    const child = tmpBody.getChild(i).copy();
++    try {
++      if (child.getType && child.getType() === DocumentApp.ElementType.PARAGRAPH) {
++        mainBody.insertParagraph(0, child.asParagraph().getText());
++      } else if (child.getType && child.getType() === DocumentApp.ElementType.LIST_ITEM) {
++        mainBody.insertListItem(0, child.asListItem().getText());
++      } else if (child.getType && child.getType() === DocumentApp.ElementType.PAGE_BREAK) {
++        mainBody.insertPageBreak(0);
++      } else {
++        // fallback - plain text
++        mainBody.insertParagraph(0, child.getText ? child.getText() : '[unsupported element]');
++      }
++    } catch (err) {
++      mainBody.insertParagraph(0, '[insert failed: ' + err.toString() + ']');
++    }
++  }
++
++  // Remove temporary doc to avoid clutter
++  DriveApp.getFileById(tmpDoc.getId()).setTrashed(true);
++}
++
++/**
++ * Convert HTML string into a Google Doc using Drive API convert.
++ * Requires Advanced Drive Service enabled in the Apps Script editor (Services -> Drive API).
++ * Returns the new docId.
++ */
++function convertHtmlToDoc(htmlString, title) {
++  const blob = Utilities.newBlob(htmlString, 'text/html', title + '.html');
++  const resource = {
++    title: title,
++    mimeType: 'text/html'
++  };
++  // Drive.Files.insert converts the uploaded HTML into a Google Doc when convert=true
++  const file = Drive.Files.insert(resource, blob, {convert: true});
++  return file.id;
++}
++
++/**
++ * Prepend HTML message into consolidated doc.
++ * This converts message HTML->Doc via Drive.Files.insert convert=true,
++ * then copies the doc content into the consolidated doc.
++ *
++ * NOTE:
++ *  - This is a pragmatic approach; it won't automatically resolve inline 'cid:' images.
++ *  - For better fidelity, add image fetching & data-URI replacement before conversion.
++ */
++function prependMessageHtmlToDoc(msg, consolidatedDocId) {
++  const htmlHeader = `
++    <html><head><meta charset="utf-8"></head><body>
++    <div><strong>Subject:</strong> ${escapeHtml(msg.getSubject() || '')}</div>
++    <div><strong>From:</strong> ${escapeHtml(msg.getFrom() || '')}</div>
++    <div><strong>To:</strong> ${escapeHtml(msg.getTo() || '')}</div>
++    <div><strong>Date:</strong> ${escapeHtml(msg.getDate().toString())}</div>
++    <hr/>`;
++
++  // Prefer the HTML body when present
++  const bodyHtml = (msg.getBody && msg.getBody()) ? msg.getBody()
++                  : escapeHtml((msg.getPlainBody && msg.getPlainBody()) ? msg.getPlainBody() : '(no body)');
++
++  const fullHtml = htmlHeader + bodyHtml + '</body></html>';
++
++  const tmpDocId = convertHtmlToDoc(fullHtml, 'gtd_tmp_html_' + new Date().getTime());
++
++  // Copy children from tmpDoc to consolidated doc at top
++  const tmpDoc  = DocumentApp.openById(tmpDocId);
++  const tmpBody = tmpDoc.getBody();
++  const mainDoc = DocumentApp.openById(consolidatedDocId);
++  const mainBody= mainDoc.getBody();
++
++  for (let i = tmpBody.getNumChildren() - 1; i >= 0; i--) {
++    const child = tmpBody.getChild(i).copy();
++    try {
++      if (child.getType && child.getType() === DocumentApp.ElementType.PARAGRAPH) {
++        mainBody.insertParagraph(0, child.asParagraph().getText());
++      } else if (child.getType && child.getType() === DocumentApp.ElementType.LIST_ITEM) {
++        mainBody.insertListItem(0, child.asListItem().getText());
++      } else if (child.getType && child.getType() === DocumentApp.ElementType.TABLE) {
++        // basic table flattening
++        const table = child.asTable();
++        for (let r = table.getNumRows() - 1; r >= 0; r--) {
++          const row = table.getRow(r);
++          let rowText = [];
++          for (let c = 0; c < row.getNumCells(); c++) {
++            rowText.push(row.getCell(c).getText());
++          }
++          mainBody.insertParagraph(0, rowText.join('\t'));
++        }
++      } else if (child.getType && child.getType() === DocumentApp.ElementType.PAGE_BREAK) {
++        mainBody.insertPageBreak(0);
++      } else if (child.getType && child.getType() === DocumentApp.ElementType.INLINE_IMAGE) {
++        const blob = child.asInlineImage().getBlob();
++        mainBody.insertImage(0, blob);
++      } else {
++        mainBody.insertParagraph(0, child.getText ? child.getText() : '[unsupported element]');
++      }
++    } catch (e) {
++      mainBody.insertParagraph(0, '[insert failed: ' + e.toString() + ']');
++    }
++  }
++
++  // Trash tmp doc
++  DriveApp.getFileById(tmpDocId).setTrashed(true);
++}
++
++/* Minimal HTML escape to avoid injecting tags into metadata fields */
++function escapeHtml(s) {
++  return String(s)
++    .replace(/&/g, '&amp;')
++    .replace(/</g, '&lt;')
++    .replace(/>/g, '&gt;');
++}
++
++/**
++ * copyElementToBody(child, destBody)
++ * A small element copier to support Paragraphs, ListItems, Tables, InlineImage, PageBreak.
++ * Not exhaustive but useful later when preserving element types becomes important.
++ */
++function copyElementToBody(child, destBody) {
++  const type = child.getType();
++  switch (type) {
++    case DocumentApp.ElementType.PARAGRAPH:
++      destBody.appendParagraph(child.asParagraph().getText());
++      break;
++    case DocumentApp.ElementType.LIST_ITEM:
++      destBody.appendListItem(child.asListItem().getText());
++      break;
++    case DocumentApp.ElementType.TABLE:
++      const table = child.asTable();
++      for (let r = 0; r < table.getNumRows(); r++) {
++        const cells = table.getRow(r).getNumCells();
++        let rowText = [];
++        for (let c = 0; c < cells; c++) {
++          rowText.push(table.getRow(r).getCell(c).getText());
++        }
++        destBody.appendParagraph(rowText.join('\t'));
++      }
++      break;
++    case DocumentApp.ElementType.INLINE_IMAGE:
++      try {
++        const blob = child.asInlineImage().getBlob();
++        destBody.appendImage(blob);
++      } catch (e) {
++        destBody.appendParagraph('[image error]');
++      }
++      break;
++    case DocumentApp.ElementType.PAGE_BREAK:
++      destBody.appendPageBreak();
++      break;
++    default:
++      try {
++        destBody.appendParagraph(child.getText ? child.getText() : child.asText().getText());
++      } catch (e) {
++        destBody.appendParagraph('[unsupported element]');
++      }
++  }
++}
++
+diff --git a/docs/GOOGLE_DOCS_MODE.md b/docs/GOOGLE_DOCS_MODE.md
+new file mode 100644
+index 0000000..2f6b8a1
+--- /dev/null
++++ b/docs/GOOGLE_DOCS_MODE.md
+@@ -0,0 +1,73 @@
++# Google Docs Output Mode (gmail-to-docs)
++
++This fork adds a Google Docs output path that **prepends** new emails (newest-first) into a **single consolidated Google Doc**.
++
++## Quick Start
++
++1. In Gmail, create a label (e.g., `CONSOLIDATE_TO_DOC`) and apply it to the messages you want consolidated.
++2. Open the Apps Script project and ensure the manifest uses V8 runtime:
++   - `appsscript.json` includes `"runtimeVersion": "V8"`.
++3. Add the files `docs_mode.gs` and `docs_utils.gs` to your project.
++4. In `docs_mode.gs`, set:
++   - `CONSOLIDATE_LABEL` to your label (e.g., `CONSOLIDATE_TO_DOC`)
++   - `OUTPUT_MODE` to `'doc_plain'` (recommended first) or `'doc_html'` (requires Drive Advanced Service).
++5. Run `gtd_init()` once (optional) and then `processMessagesToDoc()` to authorize and process initial messages.
++6. Set a time-driven trigger to run `processMessagesToDoc()` on a schedule (e.g., every 10 minutes).
++
++State is stored in Script Properties:
++- `gtd_last_iso` — ISO datetime of the last processed message.
++- `gtd_consolidated_doc_id` — doc id of the consolidated Google Doc.
++
++## Modes
++
++- `doc_plain`: converts messages to plain text with simple metadata; very robust.
++- `doc_html`: attempts HTML → Google Doc conversion via Drive API. Turn on **Advanced Drive Service** in the Apps Script editor (Services → Drive API). Better formatting for some emails, but HTML/CSS fidelity varies, and inline `cid:` images may need custom handling.
++
++## Notes / Next Steps
++
++- For very long Docs (size limits), create monthly archives and rotate `gtd_consolidated_doc_id`.
++- Inline images and attachments are not fully handled yet in this first patch. Future work:
++  - Embed inline images by fetching attachments that match `Content-ID` and inserting them as images in the Doc.
++  - Save non-image attachments to a Drive folder and insert links in the consolidated Doc.
++  - Add a guard to skip re-processing already-added messages by tracking message IDs.
++
++## Troubleshooting
++
++- If you see “Service not found: Drive”, enable **Advanced Drive Service** (Services → Add a service → Drive API).
++- If nothing is added to the doc, confirm your label name matches `CONSOLIDATE_LABEL` and there are labeled messages **newer than** `gtd_last_iso`. You can reset by setting `gtd_last_iso` to `1970-01-01T00:00:00Z` in Script Properties.
++- Logs are in **Executions** in the Apps Script editor (or `Logger.log` output).
+
